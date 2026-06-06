@@ -42,19 +42,18 @@ ollama pull gemma2:9b    # distillation model
 python experiments/run_experiment.py --domain mmlu --mode Random --edge_density 0.7 --agent_nums 7 --random_dag_seed 42 --neighbor_hops 2
 ```
 
-<!-- ## Citation
+## Citation
 
-Your support would be greatly appreciated if you find MOC interesting or useful. Please acknowledge our work by citing the paper and giving this repository a star. Feel free to open an issue if you have any questions. -->
+Your support would be greatly appreciated if you find MOC interesting or useful. Please acknowledge our work by citing the paper and giving this repository a star. Feel free to open an issue if you have any questions. 
 
-<!-- ```bibtex
-@inproceedings{
-anonymous2026moc,
-title={{MOC}: Multi-Order Communication in {LLM}-based Multi-Agent Systems},
-author={Anonymous},
-booktitle={Forty-third International Conference on Machine Learning},
-year={2026},
+```bibtex
+@article{guan2026moc,
+  title={MOC: Multi-Order Communication in LLM-based Multi-Agent Systems},
+  author={Guan, Yao and Wang, Lin and Lu, Zhihu and Wang, Ziyi and Yan, Wenzhu and Duan, Qiang},
+  journal={arXiv preprint arXiv:2606.02359},
+  year={2026}
 }
-``` -->
+```
 
 ## Acknowledgement
 
