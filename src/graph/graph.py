@@ -13,6 +13,14 @@ from src.gnn.gcn import GCN,MLP
 from torch_geometric.utils import dense_to_sparse
 from sklearn.metrics.pairwise import cosine_similarity
 from src.llm.price import cost_count_conpressed
+from src.graph.vmoc import (
+    AgentBudgetRegistry,
+    ClusterMerger,
+    PathEvaluator,
+    TrustManager,
+    estimate_tokens,
+    cosine,
+)
 class Graph(ABC):
     """
     A framework for managing and executing a network of nodes using a language model.
@@ -52,7 +60,20 @@ class Graph(ABC):
                 ism_r: float = 1.0,
                 ism_epsilon: float = 0.01,
                 ism_kppa: int = 45,
-                use_cot: bool = True,  
+                use_cot: bool = True,
+                communication_method: Optional[str] = None,
+                vmoc_token_budget: int = 2048,
+                vmoc_alpha: float = 1.0,
+                vmoc_beta: float = 1.0,
+                vmoc_gamma: float = 1.0,
+                vmoc_lambda_cost: float = 0.001,
+                vmoc_trust_decay: float = 0.9,
+                vmoc_trust_threshold: float = 0.1,
+                vmoc_eta: float = 0.2,
+                vmoc_nu: float = 0.02,
+                vmoc_theta_cross: float = 0.85,
+                vmoc_trust_rho: float = 0.2,
+                vmoc_trust_delta: float = 0.01,
                 ):
         
         if fixed_spatial_masks is None:
@@ -100,6 +121,28 @@ class Graph(ABC):
         self.ism_r = ism_r
         self.ism_epsilon = ism_epsilon
         self.ism_kppa = ism_kppa
+        if communication_method is None:
+            communication_method = "moc" if use_neighbor_summary else "vanilla"
+        self.communication_method = communication_method.lower()
+        if self.communication_method not in {"vanilla", "moc", "vmoc"}:
+            raise ValueError(f"Unsupported communication_method: {communication_method}")
+        self.use_neighbor_summary = self.communication_method != "vanilla"
+        self.vmoc_token_budget = vmoc_token_budget
+        self.vmoc_alpha = vmoc_alpha
+        self.vmoc_beta = vmoc_beta
+        self.vmoc_gamma = vmoc_gamma
+        self.vmoc_lambda_cost = vmoc_lambda_cost
+        self.vmoc_trust_decay = vmoc_trust_decay
+        self.vmoc_trust_threshold = vmoc_trust_threshold
+        self.vmoc_eta = vmoc_eta
+        self.vmoc_nu = vmoc_nu
+        self.vmoc_theta_cross = vmoc_theta_cross
+        self.trust_manager = TrustManager(self.nodes.keys())
+        self.trust_manager.rho = vmoc_trust_rho
+        self.trust_manager.delta = vmoc_trust_delta
+        self.agent_budget_registry = AgentBudgetRegistry(vmoc_token_budget, self.nodes.keys())
+        self.last_vmoc_metadata = {}
+        self.embedding_cache = {}
 
 
     def construct_adj_matrix(self):
@@ -328,6 +371,9 @@ class Graph(ABC):
                   max_time: int = 600,) -> List[Any]:
 
         log_probs = 0
+        if self.communication_method == "vmoc":
+            self.trust_manager.start_round()
+            self.agent_budget_registry.reset_round(self.nodes.keys())
         new_features = self.construct_new_features(input['task'])
         logits = self.gcn(new_features,self.role_adj_matrix)
         logits = self.mlp(logits)
@@ -361,7 +407,10 @@ class Graph(ABC):
             self.update_memory()
             
         self.connect_decision_node()
-        await self.decision_node.async_execute(input)
+        if self.communication_method == "vmoc":
+            await self.decision_node.async_execute(input, graph=self)
+        else:
+            await self.decision_node.async_execute(input)
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
@@ -370,6 +419,99 @@ class Graph(ABC):
     def update_memory(self):
         for id,node in self.nodes.items():
             node.update_memory()
+
+    def topological_rank(self, node_id: str) -> int:
+        """Return a deterministic rank induced by current spatial DAG."""
+        in_degree = {nid: len(node.spatial_predecessors) for nid, node in self.nodes.items()}
+        queue = [nid for nid, degree in in_degree.items() if degree == 0]
+        rank = {}
+        current_rank = 0
+        while queue:
+            current = queue.pop(0)
+            if current in rank:
+                continue
+            rank[current] = current_rank
+            current_rank += 1
+            for successor in self.nodes[current].spatial_successors:
+                if successor.id not in self.nodes:
+                    continue
+                in_degree[successor.id] -= 1
+                if in_degree[successor.id] == 0:
+                    queue.append(successor.id)
+        return rank.get(node_id, len(self.nodes))
+
+    async def get_neighbor_summary_with_vmoc(self, node_id: str, query: str) -> str:
+        """
+        Value-Aware Multi-Order Communication.
+
+        This keeps the original MOC implementation intact and adds the V-MOC
+        pipeline: path value evaluation, budget-aware adaptive K, path-aware
+        clustering, multi-objective merging, and trust-state recording.
+        """
+        self.trust_manager.ensure_nodes(self.nodes.keys())
+        evaluator = PathEvaluator(
+            graph=self,
+            alpha=self.vmoc_alpha,
+            beta=self.vmoc_beta,
+            gamma=self.vmoc_gamma,
+            lambda_cost=self.vmoc_lambda_cost,
+            trust_decay=self.vmoc_trust_decay,
+            trust_threshold=self.vmoc_trust_threshold,
+        )
+        candidate_paths = evaluator.enumerate_paths(node_id, self.neighbor_hops, query)
+        if not candidate_paths:
+            self.last_vmoc_metadata = {"candidate_paths": 0, "selected_paths": 0}
+            return ""
+
+        budget_manager = self.agent_budget_registry.get(node_id)
+        budget_before = budget_manager.remaining_budget
+        selected_paths, adaptive_k, path_cost_estimate = budget_manager.select(candidate_paths, evaluator)
+        if not selected_paths:
+            self.last_vmoc_metadata = {
+                "candidate_paths": len(candidate_paths),
+                "selected_paths": 0,
+                "adaptive_k": 0,
+                "path_cost_estimate": 0,
+                "budget_before": budget_before,
+                "remaining_budget": budget_manager.remaining_budget,
+            }
+            return ""
+
+        merger = ClusterMerger(
+            graph=self,
+            epsilon=self.ism_epsilon,
+            kppa=self.ism_kppa,
+            eta=self.vmoc_eta,
+            nu=self.vmoc_nu,
+            theta_cross=self.vmoc_theta_cross,
+        )
+        collected_messages = merger.collect_messages(selected_paths)
+        merged_input_tokens = sum(message.cost for message in collected_messages)
+        context = await merger.merge(collected_messages)
+        compressed_tokens = estimate_tokens(context)
+        remaining_budget = budget_manager.update_after_merge(merged_input_tokens, compressed_tokens)
+        self.trust_manager.record_messages(collected_messages, context, self.encode_text)
+        self.last_vmoc_metadata = {
+            "candidate_paths": len(candidate_paths),
+            "selected_paths": len(selected_paths),
+            "adaptive_k": adaptive_k,
+            "path_cost_estimate": path_cost_estimate,
+            "merged_input_tokens": merged_input_tokens,
+            "compressed_tokens": compressed_tokens,
+            "budget_before": budget_before,
+            "remaining_budget_after_merge": remaining_budget,
+            "collected_messages": len(collected_messages),
+            "trust": dict(self.trust_manager.trust),
+        }
+        return context
+
+    def update_communication_feedback(self, is_correct: bool) -> None:
+        if self.communication_method == "vmoc":
+            self.trust_manager.update_with_feedback(is_correct)
+
+    def merge_communication_state_from(self, other: "Graph") -> None:
+        if self.communication_method == "vmoc" and hasattr(other, "trust_manager"):
+            self.trust_manager.merge_from(other.trust_manager)
     
     def check_cycle(self, new_node, target_nodes):
         if new_node in target_nodes:
@@ -455,8 +597,11 @@ class Graph(ABC):
         Returns:
             Embedding vector as numpy array
         """
-        embedding = get_sentence_embedding(text)
-        return np.array(embedding)
+        cache_key = text or ""
+        if cache_key not in self.embedding_cache:
+            embedding = get_sentence_embedding(cache_key)
+            self.embedding_cache[cache_key] = np.array(embedding)
+        return self.embedding_cache[cache_key]
 
     async def merge_multiple_messages(self, messages: List[str], kppa: int) -> str:
         """
@@ -583,6 +728,113 @@ Constraint: Do not add new information. Output ONLY the synthesized text with no
         except Exception as e:
             print(f"[Summary] LLM merge failed: {e}, falling back to concatenation")
             return "\n\n".join(messages)
+
+    async def merge_multiple_messages_value_aware(
+        self,
+        messages: List[str],
+        kppa: int,
+        other_embeddings: List[np.ndarray],
+        eta: float,
+        nu: float,
+    ) -> str:
+        """
+        V-MOC multi-objective merge:
+        semantic fidelity + cross-cluster diversity reward - length penalty.
+        """
+        if not messages:
+            return ""
+        if len(messages) == 3:
+            return messages[-1]
+
+        try:
+            import ollama
+
+            client = ollama.AsyncClient()
+            id_i, role_i, content_i, id_j, role_j, content_j = messages
+            original_token_limit = int((kppa / 100.0) * (estimate_tokens(content_i) + estimate_tokens(content_j)))
+            original_token_limit = max(1, original_token_limit)
+            messages_set = f"""AGENT_1: [ID: {id_i} | Role: {role_i}]
+{content_i}
+
+AGENT_2: [ID: {id_j} | Role: {role_j}]
+{content_j}"""
+            prompts = [
+                f"""Synthesize AGENT_1 and AGENT_2 into one value-aware update.
+Target length: no more than {kppa}% of the original token count.
+Task: Deduplicate overlap while preserving distinct evidence, source IDs, and reasoning chain.
+Constraint: Do not add new information. Output ONLY the synthesized text.
+
+{messages_set}""",
+                f"""Merge the two agent messages with strict logical integrity.
+Target length: no more than {kppa}% of original tokens.
+Task: Preserve complete dependencies and conclusion-critical facts.
+Constraint: Do not add new information. Output ONLY the synthesized text.
+
+{messages_set}""",
+                f"""Create a high-density technical consolidation of the two messages.
+Target length: no more than {kppa}% of original tokens.
+Task: Preserve IDs, roles, formulas, parameters, code details, and exact values.
+Constraint: Do not add new information. Output ONLY the synthesized text.
+
+{messages_set}""",
+                f"""Combine AGENT_1 and AGENT_2 as an actionable evidence update.
+Target length: no more than {kppa}% of original tokens.
+Task: Prioritize final decisions and evidence that changes downstream reasoning.
+Constraint: Do not add new information. Output ONLY the synthesized text.
+
+{messages_set}""",
+                f"""Integrate the two messages while preserving path-chain structure.
+Target length: no more than {kppa}% of original tokens.
+Task: Merge only redundant statements and retain unique path evidence.
+Constraint: Do not add new information. Output ONLY the synthesized text.
+
+{messages_set}""",
+            ]
+
+            async def generate_candidate(idx: int, prompt: str) -> str:
+                print(f"[V-MOC Summary] Trying strategy {idx + 1}/5...")
+                response = await client.chat(
+                    model="gemma2:9b",
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False,
+                    options={"temperature": 0.1},
+                )
+                merged = response["message"]["content"].strip()
+                prompt_tokens = response.get("prompt_eval_count", 0)
+                completion_tokens = response.get("eval_count", 0)
+                cost_count_conpressed(prompt_tokens, completion_tokens)
+                return merged
+
+            outputs = await asyncio.gather(
+                *(generate_candidate(i, prompt) for i, prompt in enumerate(prompts))
+            )
+
+            source_embeddings = [self.encode_text(content_i), self.encode_text(content_j)]
+            scored_outputs = []
+            for output in outputs:
+                output_embedding = self.encode_text(output)
+                fidelity = sum(cosine(output_embedding, emb) for emb in source_embeddings)
+                if other_embeddings:
+                    diversity = min(1.0 - cosine(output_embedding, emb) for emb in other_embeddings)
+                else:
+                    diversity = 0.0
+                token_count = estimate_tokens(output)
+                score = fidelity + eta * diversity - nu * token_count
+                scored_outputs.append((score, token_count, output))
+                print(
+                    f"[V-MOC Summary] score={score:.4f}, fidelity={fidelity:.4f}, "
+                    f"diversity={diversity:.4f}, tokens={token_count}"
+                )
+
+            valid_outputs = [item for item in scored_outputs if item[1] <= original_token_limit]
+            if valid_outputs:
+                return max(valid_outputs, key=lambda item: item[0])[2]
+
+            # Hard length constraint fallback required by V-MOC.
+            return min(scored_outputs, key=lambda item: item[1])[2]
+        except Exception as e:
+            print(f"[V-MOC Summary] LLM merge failed: {e}, falling back to original merge")
+            return await self.merge_multiple_messages(messages, kppa)
         
     async def iterative_semantic_merging_with_clustering(
         self, 
@@ -731,8 +983,10 @@ Constraint: Do not add new information. Output ONLY the synthesized text with no
         Returns:
             ISM-aggregated summary of neighbor outputs
         """
-        if not self.use_neighbor_summary:
+        if self.communication_method == "vanilla" or not self.use_neighbor_summary:
             return ""
+        if self.communication_method == "vmoc":
+            return await self.get_neighbor_summary_with_vmoc(node_id, query)
         
         print(f"[DEBUG] get_neighbor_summary_with_ism called for node {node_id}")
         neighbors_by_hop = self.get_neighbors_by_hops(node_id, self.neighbor_hops)

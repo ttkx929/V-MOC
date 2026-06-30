@@ -120,10 +120,23 @@ def parse_args():
     
     # Neighbor Summary
     parser.add_argument('--neighbor_hops', type=int, default=1, help='Number of neighbor hops')
-    parser.add_argument('--use_neighbor_summary', action='store_true', default=True, help='Use neighbor summary')
+    parser.add_argument('--communication_method', type=str, default='moc', choices=['vanilla', 'moc', 'vmoc'], help='Communication scheme for comparison')
+    parser.add_argument('--use_neighbor_summary', action='store_true', default=True, help='Backward compatible flag; communication_method controls the actual scheme')
     parser.add_argument('--ism_r', type=float, default=1.0, help='ISM algorithm r parameter')
     parser.add_argument('--ism_epsilon', type=float, default=0.01, help='ISM algorithm epsilon parameter')
     parser.add_argument('--ism_kppa', type=int, default=45, help='ISM algorithm kppa parameter')
+    parser.add_argument('--vmoc_token_budget', type=int, default=2048, help='V-MOC per-agent token budget')
+    parser.add_argument('--vmoc_alpha', type=float, default=1.0, help='V-MOC path reliability weight')
+    parser.add_argument('--vmoc_beta', type=float, default=1.0, help='V-MOC evidence divergence weight')
+    parser.add_argument('--vmoc_gamma', type=float, default=1.0, help='V-MOC information novelty weight')
+    parser.add_argument('--vmoc_lambda_cost', type=float, default=0.001, help='V-MOC token cost penalty')
+    parser.add_argument('--vmoc_trust_decay', type=float, default=0.9, help='V-MOC path reliability decay')
+    parser.add_argument('--vmoc_trust_threshold', type=float, default=0.1, help='V-MOC path pruning trust threshold')
+    parser.add_argument('--vmoc_eta', type=float, default=0.2, help='V-MOC cross-cluster diversity reward')
+    parser.add_argument('--vmoc_nu', type=float, default=0.02, help='V-MOC length penalty')
+    parser.add_argument('--vmoc_theta_cross', type=float, default=0.85, help='V-MOC cross-cluster merge cosine threshold')
+    parser.add_argument('--vmoc_trust_rho', type=float, default=0.2, help='V-MOC trust update learning rate')
+    parser.add_argument('--vmoc_trust_delta', type=float, default=0.01, help='V-MOC no-contribution trust decay')
 
     args = parser.parse_args()
 
@@ -139,6 +152,7 @@ def parse_args():
 
     if args.n_size is None:
         args.n_size = domain_config['n_size']
+    args.use_neighbor_summary = args.communication_method != 'vanilla'
     
     if args.agent_nums is not None and len(args.agent_names) != len(args.agent_nums):
         parser.error("agent_names and agent_nums must have the same length")
@@ -221,6 +235,19 @@ async def main():
         ism_epsilon=args.ism_epsilon,
         ism_kppa=args.ism_kppa,
         use_cot=args.use_cot,
+        communication_method=args.communication_method,
+        vmoc_token_budget=args.vmoc_token_budget,
+        vmoc_alpha=args.vmoc_alpha,
+        vmoc_beta=args.vmoc_beta,
+        vmoc_gamma=args.vmoc_gamma,
+        vmoc_lambda_cost=args.vmoc_lambda_cost,
+        vmoc_trust_decay=args.vmoc_trust_decay,
+        vmoc_trust_threshold=args.vmoc_trust_threshold,
+        vmoc_eta=args.vmoc_eta,
+        vmoc_nu=args.vmoc_nu,
+        vmoc_theta_cross=args.vmoc_theta_cross,
+        vmoc_trust_rho=args.vmoc_trust_rho,
+        vmoc_trust_delta=args.vmoc_trust_delta,
         **kwargs
     )
 
@@ -231,8 +258,8 @@ async def main():
     Time.instance().value = current_time
     result_dir = Path(f"{MOC_ROOT}/result/{args.domain}")
     result_dir.mkdir(parents=True, exist_ok=True)
-    result_file = result_dir / f"{args.llm_name}_{current_time}_detail.json"
-    summary_file = result_dir / f"{args.llm_name}_{args.mode}_{current_time}.json"
+    result_file = result_dir / f"{args.llm_name}_{args.communication_method}_{current_time}_detail.json"
+    summary_file = result_dir / f"{args.llm_name}_{args.communication_method}_{args.mode}_{current_time}.json"
 
     print("="*80)
     print("Starting evaluation...")
@@ -278,10 +305,23 @@ async def main():
         "num_rounds": args.num_rounds,
         "batch_size": args.batch_size,
         "use_neighbor_summary": args.use_neighbor_summary,
+        "communication_method": args.communication_method,
         "neighbor_hops": args.neighbor_hops,
         "ism_r": args.ism_r,
         "ism_epsilon": args.ism_epsilon,
         "ism_kppa": args.ism_kppa,
+        "vmoc_token_budget": args.vmoc_token_budget,
+        "vmoc_alpha": args.vmoc_alpha,
+        "vmoc_beta": args.vmoc_beta,
+        "vmoc_gamma": args.vmoc_gamma,
+        "vmoc_lambda_cost": args.vmoc_lambda_cost,
+        "vmoc_trust_decay": args.vmoc_trust_decay,
+        "vmoc_trust_threshold": args.vmoc_trust_threshold,
+        "vmoc_eta": args.vmoc_eta,
+        "vmoc_nu": args.vmoc_nu,
+        "vmoc_theta_cross": args.vmoc_theta_cross,
+        "vmoc_trust_rho": args.vmoc_trust_rho,
+        "vmoc_trust_delta": args.vmoc_trust_delta,
         "random_dag_seed": args.random_dag_seed,
         "timestamp": current_time,
     }
@@ -292,6 +332,8 @@ async def main():
         "total_executed": total_executed,
         "total_runtime_sec": round(time.time() - run_start_time, 3),
     }
+    if args.communication_method == 'vmoc':
+        metrics["vmoc_final_trust"] = dict(graph.trust_manager.trust)
     
     save_final_summary(summary_file, config, metrics)
 

@@ -35,14 +35,17 @@ class FinalWriteCode(Node):
         self.constraint = self.prompt_set.get_decision_constraint()          
         system_prompt = f"{self.role}.\n {self.constraint}"
         spatial_str = ""
-        for id, info in spatial_info.items():
-            if info['output'].startswith("```python") and info['output'].endswith("```"):  # is python code
-                self.internal_tests = self.extract_example(raw_inputs)
-                output = info['output'].lstrip("```python\n").rstrip("\n```")
-                is_solved, feedback, state = PyExecutor().execute(output, self.internal_tests, timeout=10)
-                spatial_str += f"Agent {id} as a {info['role']}:\n\nThe code written by the agent is:\n\n{info['output']}\n\n Whether it passes internal testing? {is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
-            else:
-                spatial_str += f"Agent {id} as a {info['role']} provides the following info: {info['output']}\n\n"
+        if neighbor_summary:
+            spatial_str = neighbor_summary
+        else:
+            for id, info in spatial_info.items():
+                if info['output'].startswith("```python") and info['output'].endswith("```"):  # is python code
+                    self.internal_tests = self.extract_example(raw_inputs)
+                    output = info['output'].lstrip("```python\n").rstrip("\n```")
+                    is_solved, feedback, state = PyExecutor().execute(output, self.internal_tests, timeout=10)
+                    spatial_str += f"Agent {id} as a {info['role']}:\n\nThe code written by the agent is:\n\n{info['output']}\n\n Whether it passes internal testing? {is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                else:
+                    spatial_str += f"Agent {id} as a {info['role']} provides the following info: {info['output']}\n\n"
         
         user_prompt = f"The task is:\n\n{raw_inputs['task']}.\n At the same time, the outputs and feedbacks of other agents are as follows:\n\n{spatial_str}\n\n"
         
@@ -86,8 +89,11 @@ class FinalRefer(Node):
         system_prompt = f"{self.role}.\n {self.constraint}"
         
         spatial_str = ""
-        for id, info in spatial_info.items():
-            spatial_str += id + ": " + info['output'] + "\n\n"
+        if neighbor_summary:
+            spatial_str = neighbor_summary
+        else:
+            for id, info in spatial_info.items():
+                spatial_str += id + ": " + info['output'] + "\n\n"
         decision_few_shot = self.prompt_set.get_decision_few_shot()
         user_prompt = f"{decision_few_shot} The task is:\n\n {raw_inputs['task']}.\n At the same time, the output of other agents is as follows:\n\n{spatial_str}"
         

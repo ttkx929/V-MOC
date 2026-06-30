@@ -28,6 +28,7 @@ async def train_batch(graph, batch_data, dataset_instance, num_rounds: int, opti
         utilities: List of correctness values per sample.
     """
     tasks = []
+    realized_graphs = []
     answers = []
     
     for record in batch_data:
@@ -39,6 +40,7 @@ async def train_batch(graph, batch_data, dataset_instance, num_rounds: int, opti
         answer = dataset_instance.record_to_target_answer(record)
         answers.append(answer)
         
+        realized_graphs.append(realized_graph)
         tasks.append(asyncio.create_task(realized_graph.arun(input_dict, num_rounds)))
     
     raw_results = await asyncio.gather(*tasks)
@@ -54,20 +56,24 @@ async def train_batch(graph, batch_data, dataset_instance, num_rounds: int, opti
         from src.tools.coding.python_executor import PyExecutor
         executor = PyExecutor()
         
-        for pred_answer, log_prob, test_case in zip(raw_answers, log_probs, answers):
+        for realized_graph, pred_answer, log_prob, test_case in zip(realized_graphs, raw_answers, log_probs, answers):
             code = dataset_instance.postprocess_answer(pred_answer)
             is_correct, _, _ = executor.execute(code, [test_case], timeout=100)
             correct_count += int(is_correct)
+            realized_graph.update_communication_feedback(is_correct)
+            graph.merge_communication_state_from(realized_graph)
             
             utility = float(is_correct)
             utilities.append(utility)
             single_loss = -log_prob * utility
             loss_list.append(single_loss)
     else:
-        for pred_answer, log_prob, true_answer in zip(raw_answers, log_probs, answers):
+        for realized_graph, pred_answer, log_prob, true_answer in zip(realized_graphs, raw_answers, log_probs, answers):
             predicted = dataset_instance.postprocess_answer(pred_answer)
             is_correct = (predicted == true_answer)
             correct_count += int(is_correct)
+            realized_graph.update_communication_feedback(is_correct)
+            graph.merge_communication_state_from(realized_graph)
             
             utility = 1.0 if is_correct else 0.0
             utilities.append(utility)
@@ -95,6 +101,7 @@ async def evaluate_batch(graph, batch_data, dataset_instance, num_rounds: int):
         accuracy: Accuracy for this batch.
     """
     tasks = []
+    realized_graphs = []
     answers = []
     questions = []
 
@@ -109,6 +116,7 @@ async def evaluate_batch(graph, batch_data, dataset_instance, num_rounds: int):
         questions.append(input_dict.get('task', str(record.get('question', ''))))
         answers.append(answer)
         
+        realized_graphs.append(realized_graph)
         tasks.append(asyncio.create_task(realized_graph.arun(input_dict, num_rounds)))
     
     raw_results = await asyncio.gather(*tasks)
@@ -123,10 +131,12 @@ async def evaluate_batch(graph, batch_data, dataset_instance, num_rounds: int):
         from src.tools.coding.python_executor import PyExecutor
         executor = PyExecutor()
         
-        for question, pred_answer, test_case in zip(questions, raw_answers, answers):
+        for realized_graph, question, pred_answer, test_case in zip(realized_graphs, questions, raw_answers, answers):
             code = dataset_instance.postprocess_answer(pred_answer)
             is_correct, _, _ = executor.execute(code, [test_case], timeout=100)
             correct_count += int(is_correct)
+            realized_graph.update_communication_feedback(is_correct)
+            graph.merge_communication_state_from(realized_graph)
             
             results.append({
                 "Question": question,
@@ -135,10 +145,12 @@ async def evaluate_batch(graph, batch_data, dataset_instance, num_rounds: int):
                 "Correct": is_correct
             })
     else:
-        for question, pred_answer, true_answer in zip(questions, raw_answers, answers):
+        for realized_graph, question, pred_answer, true_answer in zip(realized_graphs, questions, raw_answers, answers):
             predicted = dataset_instance.postprocess_answer(pred_answer)
             is_correct = (predicted == true_answer)
             correct_count += int(is_correct)
+            realized_graph.update_communication_feedback(is_correct)
+            graph.merge_communication_state_from(realized_graph)
             
             results.append({
                 "Question": question,
